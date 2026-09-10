@@ -1,6 +1,14 @@
+# Raw dataset is 493MB - reviewers download it themselves
 data/raw/twcs.csv
 twcs.csv
-__pycache__/
 *.pyc
+__pycache__/
 .pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.env
 .superpowers/
+
+# NOTE: cache/llm_cache.sqlite is deliberately NOT ignored.
+# It is how reviewers reproduce headline numbers without an API key.

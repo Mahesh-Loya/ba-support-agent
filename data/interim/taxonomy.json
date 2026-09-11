@@ -1,0 +1,25 @@
+{
+  "intents": [
+    "flight_disruption",
+    "baggage",
+    "booking_management",
+    "refund_compensation",
+    "loyalty_account",
+    "complaint_feedback",
+    "general_enquiry",
+    "praise_or_social",
+    "other"
+  ],
+  "definitions": {
+    "flight_disruption": "Delays, cancellations, diversions, missed connections, and the disruption-caused need to rebook, without an explicit ask for money back.",
+    "baggage": "Lost, delayed, or damaged baggage; carry-on/checked allowance, size/weight, and packing questions.",
+    "booking_management": "Making or changing a booking, seat selection, upgrades, name changes, and online check-in / Manage-My-Booking / app / website functional errors (can't find booking, error message, page won't load).",
+    "refund_compensation": "Explicit requests for money back: refunds, EU261 compensation, vouchers, or reimbursement for disruption-caused costs (hotel, rebooking).",
+    "loyalty_account": "Executive Club tier status, Avios points earn/redeem/expiry/transfer, and loyalty account access issues.",
+    "complaint_feedback": "Negative feedback about a past experience (seats, staff, food, lounge, pricing/fees) or an unresolved/escalated complaint case, with no single fixable action requested.",
+    "general_enquiry": "Policy or how-to questions asked with no active problem (unaccompanied minors, adding an Exec number, group-booking rules, transferring a deposit).",
+    "praise_or_social": "Compliments, thanks, casual banter, DM requests, or reactions to marketing content/photos; not a request that needs resolving, at most a brief acknowledgment.",
+    "other": "Not a support request: spam, unintelligible text, or a topic BA support does not handle."
+  },
+  "notes": "Derived from KMeans (k=12, seed=42, all-MiniLM-L6-v2 embeddings, TF-IDF top-terms) over a 4000-message random sample of the corpus split (7825 rows). Full cluster dump in data/interim/clusters.json. Decisions made when hand-naming: (1) Renamed the skeleton's 'booking_change' to 'booking_management' and folded the skeleton's separate 'checkin_boarding' into it: cluster 4 (n=420; top terms booking/check/online/app/help/website/trying/error) was overwhelmingly about broken Manage-My-Booking/app/website flows and seat-selection errors, not check-in specifically -- no cluster in this run showed distinct check-in/boarding-pass language, so inventing a separate checkin_boarding intent would not be defensible from the data. (2) Merged clusters 0 (n=331, seat/service complaints), 5 (n=341, formal complaints/no response/case refs), and 10 (n=293, lounge/business-class/food/fee complaints) into one 'complaint_feedback' intent: despite different top-terms (different complaint subjects) they share the same function -- negative feedback about a past experience with no single fixable ask. (3) Kept 'flight_disruption' as clusters 7 (n=333, cancelled/refund/cancel) + 11 (n=412, delayed/lhr/heathrow/delay) combined, and separated 'refund_compensation' out as a cross-cutting intent rather than a cluster: cluster 7 mixed pure disruption reports with explicit compensation/refund asks, and embeddings of short tweets did not cleanly separate 'my flight was cancelled' from 'I want compensation for my cancelled flight'. A human labeller distinguishes them by whether the message explicitly asks for money back (-> refund_compensation) versus just reports the disruption (-> flight_disruption); this is a labelling-time judgment call, flagged for the interview defense. (4) Added 'praise_or_social' as a genuine 8th intent not present in the starting skeleton, merging clusters 1 (n=491, thanks/great/crew), 3 (n=83, reactions to the safety-video ad), and 9 (n=441, thank/dm/home/great): together these are ~25% of the sample (1015/4000) and are compliments, banter, or ad reactions, not support requests. Routing a quarter of the corpus into the catch-all 'other' would have hidden a real, high-volume category that a reply-drafting model must treat differently (short acknowledgment, not a ticket) -- so it was named explicitly instead of collapsed into 'other'. (5) 'general_enquiry' (cluster 2, n=362), 'loyalty_account' (cluster 6, n=109), and 'baggage' (cluster 8, n=384) matched the skeleton's original definitions closely and were kept with only minor wording tightening. (6) 'other' maps to no single sampled cluster -- KMeans forces every point into one of k clusters so a true spam/unintelligible outlier bucket does not self-assemble at k=12 -- but it is retained as the necessary residual bucket for the human labelling pass on the 200-example golden set."
+}

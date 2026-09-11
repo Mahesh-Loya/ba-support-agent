@@ -18,6 +18,46 @@ def test_hard_rules_do_not_fire_on_a_plain_question():
                                    "general_enquiry") is None
 
 
+@pytest.mark.parametrize("text", [
+    "I feel suicidal and don't know what to do",
+    "I want to end it all",
+    "I am having a breakdown right now",
+    "I am having a panic attack on this plane",
+    "I can't cope anymore with this",
+    "I want to kill myself",
+])
+def test_hard_rules_fire_on_crisis_wellbeing_language(text):
+    assert decide.check_hard_rules(text, "other") == "crisis_wellbeing"
+
+
+def test_crisis_message_always_escalates_even_at_max_confidence():
+    d = decide.decide("I feel suicidal, please help", "other",
+                      confidence=1.0, top_similarity=1.0, clf_margin=1.0,
+                      threshold=0.0)
+    assert d.action == "escalate"
+    assert d.rule_fired == "crisis_wellbeing"
+
+
+@pytest.mark.parametrize("text", [
+    "I will be taking this further",
+    "I am escalating this to Trading Standards",
+    "I know my rights and will contact the regulator",
+    "I will file a complaint with CEDR",
+    "I am reporting you to the press",
+    "This is going to BBC Watchdog",
+])
+def test_hard_rules_fire_on_indirect_legal_threats(text):
+    assert decide.check_hard_rules(text, "other") == "legal_or_safety"
+
+
+@pytest.mark.parametrize("text", [
+    "I'm desperate to get a window seat",
+    "my phone battery died",
+])
+def test_hard_rules_do_not_fire_on_benign_lookalike_phrasing(text):
+    assert decide.check_hard_rules(text, "other") is None
+
+
 def test_refund_intent_always_escalates_even_at_max_confidence():
     d = decide.decide("please refund me", "refund_compensation",
                       confidence=1.0, top_similarity=1.0, clf_margin=1.0,

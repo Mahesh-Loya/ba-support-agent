@@ -12,12 +12,28 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# These hard rules are DELIBERATELY over-inclusive. The cost of a false
+# escalation is one extra human minute; the cost of a missed escalation on
+# crisis or legal/safety language is unacceptable. When in doubt, the rule
+# should fire.
 HARD_RULES: list[tuple[str, str]] = [
+    ("crisis_wellbeing", r"\b(suicid\w*|self[- ]?harm\w*|kill(?:ing)?\s+myself|"
+                         r"end(?:ing)?\s+(?:it all|my life|it)|"
+                         r"want(?:ed)?\s+to\s+die|"
+                         r"don'?t\s+want\s+to\s+(?:live|be here)(?:\s+anymore)?|"
+                         r"can'?t\s+(?:cope|go on|take\s+(?:it|this)(?:\s+any\s*more)?)|"
+                         r"(?:having|have)\s+a\s+(?:mental\s+|nervous\s+)?breakdown|"
+                         r"panic\s+attack|"
+                         r"give\s+up\s+on\s+(?:life|everything)|"
+                         r"no\s+(?:point|reason)\s+(?:in\s+)?(?:living|going\s+on))\b"),
     ("money_claim", r"\b(refund|compensat\w*|reimburs\w*|eu ?261|voucher|"
                     r"money back|charge(d)? me|overcharg\w*)\b"),
     ("legal_or_safety", r"\b(solicitor|lawyer|legal action|sue|court|ombudsman|"
                         r"caa|dangerous|unsafe|smoke|fire|injur\w*|assault\w*|"
-                        r"discriminat\w*|racist)\b"),
+                        r"discriminat\w*|racist|taking this further|"
+                        r"escalat\w*\s+this|trading standards|small claims|"
+                        r"my rights|regulator\w*|cedr|file a complaint|"
+                        r"report you to|the press|bbc watchdog|watchdog)\b"),
     ("lost_baggage", r"\b(lost|missing|never arrived|didn'?t arrive|no sign of)\b"
                      r"[^.]{0,40}\b(bag|bags|baggage|luggage|suitcase|case)\b"
                      r"|\b(bag|bags|baggage|luggage|suitcase)\b[^.]{0,40}"

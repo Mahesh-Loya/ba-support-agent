@@ -21,10 +21,14 @@ SEED = 42
 TEMPERATURE = 0.0
 
 # --- Models -------------------------------------------------------------
-# Drafter and judge are deliberately different families.
-DRAFTER_MODEL = "gemini-2.5-flash"
-DRAFTER_PROVIDER = "gemini"
-JUDGE_MODEL = "llama-3.3-70b-versatile"
+# Drafter and judge are deliberately different families so the judge never
+# grades its own output. Both live on the Groq free tier (the only key this
+# project has). qwen/qwen3.6-27b was tried and rejected: it emits <think>
+# blocks that break JSON parsing. The stronger model (gpt-oss-120b) is
+# deliberately the judge, not the drafter.
+DRAFTER_MODEL = "qwen/qwen3.8-27b"
+DRAFTER_PROVIDER = "groq"
+JUDGE_MODEL = "openai/gpt-oss-120b"
 JUDGE_PROVIDER = "groq"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 

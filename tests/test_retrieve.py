@@ -47,3 +47,15 @@ def test_retriever_only_ever_holds_corpus_split_rows():
     r = retrieve.Retriever(df)
     assert len(r.corpus) == 1
     assert r.corpus.iloc[0].customer_text == "corpus row"
+
+
+def test_retriever_refuses_a_frame_without_a_split_column():
+    # The anti-leakage guarantee must not silently degrade to "trust the
+    # caller" when the split column is missing.
+    df = pd.DataFrame(dict(
+        customer_tweet_id=[1, 2],
+        customer_text=["row one", "row two"],
+        agent_text=["a", "b"],
+    ))
+    with pytest.raises(ValueError):
+        retrieve.Retriever(df)

@@ -42,7 +42,7 @@ class SimpleBaseline:
         self.vec_ = TfidfVectorizer(ngram_range=(1, 2), min_df=1,
                                     sublinear_tf=True, stop_words="english")
         X = self.vec_.fit_transform(texts)
-        self.clf_ = LogisticRegression(max_iter=2000, random_state=config.SEED, C=10.0)
+        self.clf_ = LogisticRegression(max_iter=2000, random_state=config.SEED)
         self.clf_.fit(X, labels)
         self.classes_ = list(self.clf_.classes_)
         return self

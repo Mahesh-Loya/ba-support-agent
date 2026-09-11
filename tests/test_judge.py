@@ -44,6 +44,49 @@ def test_judge_prompt_includes_reply_message_and_historical_cases():
     assert CASES[0].agent_text in p
 
 
+def test_parse_verdict_coerces_stringified_false_to_false():
+    v = judge.parse_verdict(
+        '{"grounded": "false", "helpful": true, "on_brand": true, '
+        '"no_overpromise": true, "rationale": "x"}'
+    )
+    assert v.grounded is False
+    assert v.is_harmful
+
+
+def test_parse_verdict_coerces_stringified_true_to_true():
+    v = judge.parse_verdict(
+        '{"grounded": "true", "helpful": true, "on_brand": true, '
+        '"no_overpromise": true, "rationale": "x"}'
+    )
+    assert v.grounded is True
+
+
+def test_parse_verdict_coerces_numeric_bools():
+    v = judge.parse_verdict(
+        '{"grounded": 1, "helpful": 0, "on_brand": true, '
+        '"no_overpromise": true, "rationale": "x"}'
+    )
+    assert v.grounded is True
+    assert v.helpful is False
+
+
+def test_parse_verdict_defaults_unexpected_types_to_false():
+    v = judge.parse_verdict(
+        '{"grounded": ["not", "a", "bool"], "helpful": null, '
+        '"on_brand": true, "no_overpromise": true, "rationale": "x"}'
+    )
+    assert v.grounded is False
+    assert v.helpful is False
+
+
+def test_parse_verdict_defaults_missing_keys_to_false():
+    v = judge.parse_verdict('{"on_brand": true}')
+    assert v.grounded is False
+    assert v.helpful is False
+    assert v.no_overpromise is False
+    assert v.on_brand is True
+
+
 def test_judge_reply_uses_the_judge_model_not_the_drafter(monkeypatch):
     seen = {}
 

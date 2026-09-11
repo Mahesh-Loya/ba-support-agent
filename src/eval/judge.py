@@ -56,6 +56,37 @@ def build_judge_prompt(customer: str, reply: str, cases: list[Case]) -> str:
     )
 
 
+_TRUE_STRINGS = {"true", "yes"}
+_FALSE_STRINGS = {"false", "no"}
+
+
+def _coerce_bool(value: object) -> bool:
+    """Strictly coerce a judge-supplied axis value to bool.
+
+    Fail-closed: only real booleans, 0/1 ints, and the strings
+    true/false/yes/no (case-insensitive) are recognised. Anything else -
+    a different string, a list, null, a float, etc. - defaults to False so a
+    judge that emits a stringified boolean (e.g. "false") can never be
+    silently read as a pass.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return False
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _TRUE_STRINGS:
+            return True
+        if s in _FALSE_STRINGS:
+            return False
+        return False
+    return False
+
+
 def parse_verdict(raw: str) -> Verdict:
     cleaned = _FENCE.sub("", raw.strip())
     m = re.search(r"\{.*\}", cleaned, re.S)
@@ -66,10 +97,10 @@ def parse_verdict(raw: str) -> Verdict:
     except json.JSONDecodeError:
         return Verdict(False, False, False, False, "unparseable judge response")
     return Verdict(
-        grounded=bool(d.get("grounded", False)),
-        helpful=bool(d.get("helpful", False)),
-        on_brand=bool(d.get("on_brand", False)),
-        no_overpromise=bool(d.get("no_overpromise", False)),
+        grounded=_coerce_bool(d.get("grounded", False)),
+        helpful=_coerce_bool(d.get("helpful", False)),
+        on_brand=_coerce_bool(d.get("on_brand", False)),
+        no_overpromise=_coerce_bool(d.get("no_overpromise", False)),
         rationale=str(d.get("rationale", "")),
     )
 

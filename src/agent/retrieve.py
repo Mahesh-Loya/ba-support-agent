@@ -23,8 +23,13 @@ class Case:
 
 class Retriever:
     def __init__(self, corpus: pd.DataFrame):
-        if "split" in corpus.columns:
-            corpus = corpus[corpus.split == "corpus"]
+        if "split" not in corpus.columns:
+            raise ValueError(
+                "Retriever requires a 'split' column so it can enforce the "
+                "corpus-only anti-leakage guarantee; refusing to treat a "
+                "frame without one as safe corpus data."
+            )
+        corpus = corpus[corpus.split == "corpus"]
         self.corpus = corpus.reset_index(drop=True)
         self._vec = embed.embed(self.corpus.customer_text.astype(str).tolist())
 

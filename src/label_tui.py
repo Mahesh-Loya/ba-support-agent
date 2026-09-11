@@ -14,6 +14,10 @@ Two modes, selected by the first CLI argument:
     Writes data/golden/quality.jsonl. Target ~100 examples; resumable like
     intent mode.
 
+Every keyboard input on the path that produces ground truth is validated and
+re-prompted on ambiguous input rather than silently defaulted - a fat-fingered
+keystroke must never silently record the wrong label or silently skip one.
+
 Usage:
     python -m src.label_tui                       # intent mode, round 1, default pool
     python -m src.label_tui intent 2 golden_pool_round2.jsonl
@@ -53,14 +57,84 @@ QUALITY_PROMPTS = {
 }
 
 
+# --------------------------------------------------------------------------
+# Pure parsing helpers - no I/O, no console, unit-testable in isolation.
+# Each one either returns an unambiguous result or a sentinel meaning
+# "invalid, re-prompt" - none of them silently guess.
+# --------------------------------------------------------------------------
+
+def parse_action(raw: str) -> str | None:
+    """'a'/'auto' -> 'auto', 'e'/'escalate' -> 'escalate', anything else -> None."""
+    r = raw.strip().lower()
+    if r in ("a", "auto"):
+        return "auto"
+    if r in ("e", "escalate"):
+        return "escalate"
+    return None
+
+
+def parse_intent_input(raw: str, n_intents: int) -> tuple[str, int | None]:
+    """Classify a raw keystroke for the intent prompt.
+
+    Returns (kind, value):
+      ("quit", None)   - labeller typed 'q', stop the session
+      ("skip", None)   - labeller deliberately typed 's', skip this example
+      ("index", i)     - a valid intent index in [0, n_intents)
+      ("invalid", None) - anything else (typo, out-of-range, blank, ...);
+                          the caller must re-prompt the SAME example, never
+                          silently advance.
+    """
+    r = raw.strip().lower()
+    if r == "q":
+        return ("quit", None)
+    if r == "s":
+        return ("skip", None)
+    if r.isdigit() and 0 <= int(r) < n_intents:
+        return ("index", int(r))
+    return ("invalid", None)
+
+
+def parse_escalation_reason(raw: str) -> str | None:
+    """Look up a reason code; None (not 'other') on invalid input so the
+    caller re-prompts instead of recording a reason that isn't one of the
+    six enumerated ones."""
+    return ESCALATION_REASONS.get(raw.strip())
+
+
+def parse_yn(raw: str) -> bool | None:
+    """'y' -> True, 'n' -> False, anything else -> None (re-prompt)."""
+    r = raw.strip().lower()
+    if r == "y":
+        return True
+    if r == "n":
+        return False
+    return None
+
+
+# --------------------------------------------------------------------------
+# I/O helpers
+# --------------------------------------------------------------------------
+
 def _load_done(path) -> dict:
+    """Read already-labelled records keyed by customer_tweet_id.
+
+    Tolerant of a corrupt trailing line (e.g. a Ctrl+C mid-write): a bad line
+    is reported with its line number and file, then skipped, so the rest of
+    the file - and the labeller's session - is never blocked by one bad row.
+    """
     if not path.exists():
         return {}
     done = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
             r = json.loads(line)
             done[r["customer_tweet_id"]] = r
+        except (json.JSONDecodeError, KeyError) as exc:
+            print(f"[label_tui] warning: skipping corrupt line {lineno} in "
+                  f"{path} ({exc}). That entry will need re-labelling; "
+                  f"the rest of the file loaded fine.")
     return done
 
 
@@ -68,6 +142,40 @@ def _append(path, rec: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# --------------------------------------------------------------------------
+# Interactive prompt loops - thin wrappers around the pure parsers above,
+# re-prompting on anything invalid instead of guessing.
+# --------------------------------------------------------------------------
+
+def _prompt_action(con: Console) -> str:
+    while True:
+        act = input("  [a]uto-handle / [e]scalate > ")
+        parsed = parse_action(act)
+        if parsed is not None:
+            return parsed
+        con.print(f"  [red]'{act.strip()}' is not 'a'/'auto' or 'e'/'escalate' - try again[/red]")
+
+
+def _prompt_escalation_reason(con: Console) -> str:
+    con.print("  " + "  ".join(f"[cyan]{k}[/cyan]={v}"
+                               for k, v in ESCALATION_REASONS.items()))
+    while True:
+        raw = input("  reason # > ")
+        reason = parse_escalation_reason(raw)
+        if reason is not None:
+            return reason
+        con.print(f"  [red]'{raw.strip()}' is not one of 1-6 - try again[/red]")
+
+
+def _prompt_yn(con: Console, prompt: str) -> bool:
+    while True:
+        raw = input(prompt)
+        val = parse_yn(raw)
+        if val is not None:
+            return val
+        con.print("  [red]please press y or n[/red]")
 
 
 def main(round_id: int = 1, pool_path=DEFAULT_POOL) -> None:
@@ -82,33 +190,45 @@ def main(round_id: int = 1, pool_path=DEFAULT_POOL) -> None:
             if r.customer_tweet_id not in done or round_id != 1]
     con.print(f"[bold]{len(done)} labelled, {len(todo)} to go[/bold]\n")
 
-    for n, row in enumerate(todo, 1):
-        con.print(Panel(str(row.customer_text), title=f"[{n}/{len(todo)}] customer message"))
-        con.print("  " + "  ".join(f"[cyan]{i}[/cyan]={s}" for i, s in enumerate(intents)))
-        raw = input("intent # (or 's' skip, 'q' quit) > ").strip().lower()
-        if raw == "q":
-            break
-        if raw == "s" or not raw.isdigit() or int(raw) >= len(intents):
-            continue
-        intent = intents[int(raw)]
+    saved_count = 0
+    try:
+        n = 1
+        while n <= len(todo):
+            row = todo[n - 1]
+            con.print(Panel(str(row.customer_text), title=f"[{n}/{len(todo)}] customer message"))
+            con.print("  " + "  ".join(f"[cyan]{i}[/cyan]={s}" for i, s in enumerate(intents)))
+            raw = input("intent # (or 's' skip, 'q' quit) > ")
+            kind, value = parse_intent_input(raw, len(intents))
 
-        act = input("  [a]uto-handle / [e]scalate > ").strip().lower()
-        action = "escalate" if act.startswith("e") else "auto"
+            if kind == "quit":
+                break
+            if kind == "invalid":
+                con.print(f"  [red]'{raw.strip()}' is not a valid intent number - try again[/red]")
+                continue  # re-prompt the SAME example, do not advance n
+            n += 1
+            if kind == "skip":
+                con.print("[yellow]skipped[/yellow]\n")
+                continue
+            intent = intents[value]
 
-        reason = ""
-        if action == "escalate":
-            con.print("  " + "  ".join(f"[cyan]{k}[/cyan]={v}"
-                                       for k, v in ESCALATION_REASONS.items()))
-            reason = ESCALATION_REASONS.get(input("  reason # > ").strip(), "other")
+            action = _prompt_action(con)
 
-        _append(GOLDEN, dict(
-            customer_tweet_id=int(row.customer_tweet_id),
-            customer_text=str(row.customer_text),
-            agent_text=str(row.agent_text),
-            intent=intent, action=action,
-            escalation_reason=reason, round=round_id,
-        ))
-        con.print("[green]saved[/green]\n")
+            reason = ""
+            if action == "escalate":
+                reason = _prompt_escalation_reason(con)
+
+            _append(GOLDEN, dict(
+                customer_tweet_id=int(row.customer_tweet_id),
+                customer_text=str(row.customer_text),
+                agent_text=str(row.agent_text),
+                intent=intent, action=action,
+                escalation_reason=reason, round=round_id,
+            ))
+            saved_count += 1
+            con.print("[green]saved[/green]\n")
+    except KeyboardInterrupt:
+        con.print(f"\n[yellow]Interrupted - {saved_count} label(s) saved this session. "
+                  f"Rerun the same command to resume.[/yellow]")
 
 
 def main_quality(round_id: int = 1, pool_path=DEFAULT_POOL, target: int = 100) -> None:
@@ -127,39 +247,44 @@ def main_quality(round_id: int = 1, pool_path=DEFAULT_POOL, target: int = 100) -
     todo = [r for _, r in pool.iterrows()
             if r.customer_tweet_id not in done or round_id != 1]
     if round_id == 1:
-        todo = todo[:remaining_target] if remaining_target else todo
+        if remaining_target == 0:
+            con.print(f"[green]Target of {target} quality labels already reached "
+                      f"({len(done)} done) - nothing to do.[/green]")
+            return
+        todo = todo[:remaining_target]
     con.print(f"[bold]{len(done)} quality-labelled, {len(todo)} queued "
               f"(target {target})[/bold]\n")
 
-    for n, row in enumerate(todo, 1):
-        con.print(Panel(str(row.customer_text),
-                        title=f"[{n}/{len(todo)}] customer message"))
-        con.print(Panel(str(row.agent_text), title="BA's actual reply",
-                        border_style="yellow"))
+    saved_count = 0
+    try:
+        for n, row in enumerate(todo, 1):
+            con.print(Panel(str(row.customer_text),
+                            title=f"[{n}/{len(todo)}] customer message"))
+            con.print(Panel(str(row.agent_text), title="BA's actual reply",
+                            border_style="yellow"))
 
-        raw = input("proceed? [enter]=yes, 's'=skip, 'q'=quit > ").strip().lower()
-        if raw == "q":
-            break
-        if raw == "s":
-            continue
+            raw = input("proceed? [enter]=yes, 's'=skip, 'q'=quit > ").strip().lower()
+            if raw == "q":
+                break
+            if raw == "s":
+                continue
 
-        answers = {}
-        for axis in QUALITY_AXES:
-            while True:
-                a = input(f"  {axis} - {QUALITY_PROMPTS[axis]} (y/n) > ").strip().lower()
-                if a in ("y", "n"):
-                    answers[axis] = (a == "y")
-                    break
-                con.print("  [red]please press y or n[/red]")
+            answers = {}
+            for axis in QUALITY_AXES:
+                answers[axis] = _prompt_yn(con, f"  {axis} - {QUALITY_PROMPTS[axis]} (y/n) > ")
 
-        _append(QUALITY, dict(
-            customer_tweet_id=int(row.customer_tweet_id),
-            customer_text=str(row.customer_text),
-            agent_text=str(row.agent_text),
-            **answers,
-            round=round_id,
-        ))
-        con.print("[green]saved[/green]\n")
+            _append(QUALITY, dict(
+                customer_tweet_id=int(row.customer_tweet_id),
+                customer_text=str(row.customer_text),
+                agent_text=str(row.agent_text),
+                **answers,
+                round=round_id,
+            ))
+            saved_count += 1
+            con.print("[green]saved[/green]\n")
+    except KeyboardInterrupt:
+        con.print(f"\n[yellow]Interrupted - {saved_count} label(s) saved this session. "
+                  f"Rerun the same command to resume.[/yellow]")
 
 
 def _parse_args(argv: list[str]):

@@ -68,3 +68,50 @@ def test_reliability_bins_have_the_expected_columns():
     rel = rc.reliability(np.linspace(0, 1, 100),
                          np.linspace(0, 1, 100) > 0.5, bins=5)
     assert set(["bin_lo", "bin_hi", "mean_score", "accuracy", "n"]).issubset(rel.columns)
+
+
+def test_harm_rate_is_nan_when_nothing_is_auto_handled():
+    # Scores never reach above 0.5, so every threshold above that auto-handles
+    # nothing -- those rows must read as "no data" (NaN), not "0% harm".
+    scores = np.linspace(0.0, 0.5, 50)
+    harms = np.zeros(50, dtype=bool)
+    curve = rc.risk_coverage_curve(scores, harms)
+    empty_rows = curve[curve.threshold > 0.5]
+    assert len(empty_rows) > 0
+    assert (empty_rows.n_auto == 0).all()
+    assert empty_rows.harm_rate.apply(np.isnan).all()
+
+
+def test_pick_threshold_never_picks_a_row_below_min_auto_when_one_qualifies():
+    rng = np.random.default_rng(3)
+    scores = rng.uniform(0, 1, 500)
+    harms = rng.uniform(0, 1, 500) > scores
+    curve = rc.risk_coverage_curve(scores, harms)
+    result = rc.pick_threshold(curve, k=10, min_auto=10)
+    row = curve[curve.threshold == result["threshold"]].iloc[0]
+    assert row.n_auto >= 10
+    assert result["degenerate"] is False
+
+
+def test_pick_threshold_degenerate_path_falls_back_to_largest_n_auto():
+    # Only 3 messages total, so no threshold can ever reach min_auto=10:
+    # every row is below the volume floor.
+    scores = np.array([0.1, 0.5, 0.9])
+    harms = np.array([False, False, True])
+    curve = rc.risk_coverage_curve(scores, harms, n_points=11)
+    assert (curve.n_auto < 10).all()
+    result = rc.pick_threshold(curve, k=10, min_auto=10)
+    assert result["degenerate"] is True
+    assert np.isfinite(result["expected_cost"])
+    best_row = curve.loc[curve.n_auto.idxmax()]
+    assert result["threshold"] == pytest.approx(float(best_row.threshold))
+
+
+def test_expected_cost_from_pick_threshold_is_always_finite():
+    rng = np.random.default_rng(4)
+    scores = rng.uniform(0, 1, 50)
+    harms = rng.uniform(0, 1, 50) > scores
+    curve = rc.risk_coverage_curve(scores, harms, n_points=21)
+    for k in [1, 10, 50]:
+        result = rc.pick_threshold(curve, k=k, min_auto=10)
+        assert np.isfinite(result["expected_cost"])

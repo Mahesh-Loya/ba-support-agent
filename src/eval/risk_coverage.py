@@ -24,7 +24,10 @@ def risk_coverage_curve(scores, harms, forced_escalate=None,
         rows.append(dict(
             threshold=float(t),
             coverage=n_auto / len(scores),
-            harm_rate=float(harms[auto].mean()) if n_auto else 0.0,
+            # NaN, not 0.0, when nothing is auto-handled: a 0.0 here would read
+            # as "0% harm rate" (perfect safety) when it actually means "no
+            # data at this threshold" -- those are not the same claim.
+            harm_rate=float(harms[auto].mean()) if n_auto else float("nan"),
             n_auto=n_auto,
         ))
     return pd.DataFrame(rows)
@@ -40,14 +43,37 @@ def expected_cost(coverage: float, harm_rate: float, k: float) -> float:
     return (1.0 - coverage) * 1.0 + coverage * harm_rate * k
 
 
-def pick_threshold(curve: pd.DataFrame, k: float) -> dict:
+def pick_threshold(curve: pd.DataFrame, k: float, min_auto: int = 10) -> dict:
+    """Pick the threshold that minimises expected cost.
+
+    Rows with fewer than `min_auto` auto-handled messages are excluded before
+    minimising: their harm_rate is either NaN (n_auto == 0) or estimated from
+    too few examples to trust as the headline safety number. If no row has
+    enough volume, fall back to the row with the most auto-handled messages
+    and mark the result "degenerate" so callers don't mistake it for a
+    confident pick.
+    """
     c = curve.copy()
-    c["expected_cost"] = [expected_cost(r.coverage, r.harm_rate, k)
-                          for r in c.itertuples()]
-    best = c.loc[c.expected_cost.idxmin()]
+    qualifying = c[c.n_auto >= min_auto].copy()
+
+    if len(qualifying) > 0:
+        qualifying["expected_cost"] = [expected_cost(r.coverage, r.harm_rate, k)
+                                       for r in qualifying.itertuples()]
+        best = qualifying.loc[qualifying.expected_cost.idxmin()]
+        degenerate = False
+    else:
+        best = c.loc[c.n_auto.idxmax()].copy()
+        # coverage is 0 whenever harm_rate is NaN here, so the harm contribution
+        # to cost is genuinely 0 -- substitute 0.0 only for this computation,
+        # never in the reported harm_rate itself.
+        safe_harm_rate = 0.0 if pd.isna(best.harm_rate) else float(best.harm_rate)
+        best["expected_cost"] = expected_cost(best.coverage, safe_harm_rate, k)
+        degenerate = True
+
     return dict(threshold=float(best.threshold), coverage=float(best.coverage),
                 harm_rate=float(best.harm_rate),
-                expected_cost=float(best.expected_cost))
+                expected_cost=float(best.expected_cost),
+                degenerate=degenerate)
 
 
 def sensitivity(curve: pd.DataFrame, ks=(2, 5, 10, 20, 50)) -> pd.DataFrame:
@@ -85,8 +111,9 @@ def plot_risk_coverage(curve: pd.DataFrame, path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    c = curve[curve.n_auto > 0]
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(curve.coverage, curve.harm_rate, marker=".", lw=1)
+    ax.plot(c.coverage, c.harm_rate, marker=".", lw=1)
     ax.set_xlabel("coverage (share of volume auto-handled)")
     ax.set_ylabel("harm rate among auto-handled")
     ax.set_title("Risk-coverage: what can we safely automate?")

@@ -20,6 +20,17 @@ _PART = re.compile(r"(?:^\s*\(?[1-9]/[1-9]\)?\.?\s*)|(?:\s*\(?[1-9]/[1-9]\)?\.?\
 _HANDLE = re.compile(r"@\w+")
 _TWITTER_TS = "%a %b %d %H:%M:%S %z %Y"
 
+# Gap threshold separating a genuine multi-part reply (continuation tweets
+# posted seconds-to-minutes apart) from two temporally-distinct reply
+# episodes to the same customer tweet (BA replying again, much later).
+# Chosen from the measured gap distribution across all multi-part reply
+# groups in the real dataset: p95 = ~1.9 min, p99 = ~5.4 min, then a sparse
+# region with almost no gaps between 10 and 15 minutes before the mass of
+# far larger (often multi-hour) gaps resumes. 10 minutes sits just past
+# that empirical dead zone: comfortably above p99 (continuations are
+# essentially never split) while excluding the separate-episode tail.
+GAP_THRESHOLD = pd.Timedelta(minutes=10)
+
 
 def strip_signature(text: str) -> tuple[str, str | None]:
     m = _SIG.search(text)
@@ -83,6 +94,29 @@ def _keep_longest_reply(out: pd.DataFrame) -> pd.DataFrame:
                .reset_index(drop=True))
 
 
+def _first_episode(ordered: pd.DataFrame) -> pd.DataFrame:
+    """Given a group's parts sorted chronologically (ties broken by
+    tweet_id), return only the leading run of parts that form one
+    continuous reply episode: consecutive parts whose gap from the
+    previous part is <= GAP_THRESHOLD.
+
+    A gap larger than GAP_THRESHOLD means BA replied again later, to a
+    conversation that has already moved on -- that is a follow-up, not a
+    continuation of the same reply, so it and everything after it is
+    dropped. If no gap exceeds the threshold, the whole group is one
+    episode.
+    """
+    ordered = ordered.reset_index(drop=True)
+    if len(ordered) < 2:
+        return ordered
+    gaps = ordered._ts.diff()
+    over = gaps > GAP_THRESHOLD
+    if not over.any():
+        return ordered
+    cut = over.idxmax()  # position of the first gap exceeding the threshold
+    return ordered.iloc[:cut]
+
+
 def build_pairs(df: pd.DataFrame, brand: str) -> pd.DataFrame:
     """First-contact pairs: a customer's opening message and BA's full reply.
 
@@ -127,7 +161,8 @@ def build_pairs(df: pd.DataFrame, brand: str) -> pd.DataFrame:
         if pd.notna(parent.in_response_to_tweet_id):
             continue  # not a first-contact message
 
-        ordered = group.sort_values("_ts")
+        ordered = group.sort_values(["_ts", "tweet_id"])
+        ordered = _first_episode(ordered)
         parts = []
         sig = None
         for t in ordered.text:
@@ -165,7 +200,8 @@ def assign_split(pairs: pd.DataFrame, corpus_end: str) -> pd.DataFrame:
 
 
 def run_ingest() -> Path:
-    df = pd.read_csv(config.RAW_CSV, dtype={"author_id": str, "text": str})
+    df = pd.read_csv(config.RAW_CSV, dtype={"author_id": str, "text": str},
+                      encoding="utf-8")
     pairs = build_pairs(df, config.BRAND)
     pairs = assign_split(pairs, config.CORPUS_END)
     pairs = pairs.dropna(subset=["created_at"])

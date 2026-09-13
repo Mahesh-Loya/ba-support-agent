@@ -98,3 +98,18 @@ def test_judge_reply_uses_the_judge_model_not_the_drafter(monkeypatch):
     judge.judge_reply("c", "r", CASES)
     assert seen["model"] == judge.config.JUDGE_MODEL
     assert seen["model"] != judge.config.DRAFTER_MODEL
+
+
+def test_judge_reply_uses_low_reasoning_effort(monkeypatch):
+    # gpt-oss-120b is a reasoning model that burns its whole max_tokens
+    # budget on internal reasoning before writing to content unless steered
+    # down - reasoning_effort="low" is what keeps content non-empty.
+    seen = {}
+
+    def fake(prompt, **kw):
+        seen.update(kw)
+        return GOOD
+
+    monkeypatch.setattr(judge.llm, "complete", fake)
+    judge.judge_reply("c", "r", CASES)
+    assert seen["reasoning_effort"] == "low"

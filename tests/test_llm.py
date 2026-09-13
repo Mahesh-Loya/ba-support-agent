@@ -100,6 +100,53 @@ def test_concurrent_cache_writes_from_many_threads_are_not_dropped(tmp_path, mon
         assert llm._cache_get(db, k) == f"response-{i}"
 
 
+def test_cache_key_reasoning_effort_differs_from_legacy_none():
+    # The 7 old openai/gpt-oss-120b rows in the committed cache were written
+    # with the pre-fix cache_key, which never had this dimension at all -
+    # equivalent to reasoning_effort=None here. A judge call that now passes
+    # reasoning_effort="low" must compute a genuinely different key so it can
+    # never collide with (or be shadowed by) one of those broken entries.
+    legacy = llm.cache_key("groq", "openai/gpt-oss-120b", "p", 0.0, 200)
+    fixed = llm.cache_key("groq", "openai/gpt-oss-120b", "p", 0.0, 200,
+                          reasoning_effort="low")
+    assert legacy != fixed
+    explicit_none = llm.cache_key("groq", "openai/gpt-oss-120b", "p", 0.0, 200,
+                                  reasoning_effort=None)
+    assert explicit_none == legacy
+
+
+def test_complete_passes_reasoning_effort_through_to_call_provider(tmp_path, monkeypatch):
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    seen = {}
+
+    def fake(prompt, **kw):
+        seen.update(kw)
+        return "resp"
+
+    monkeypatch.setattr(llm, "_call_provider", fake)
+    llm.complete("p", provider="groq", model="openai/gpt-oss-120b",
+                 reasoning_effort="low")
+    assert seen["reasoning_effort"] == "low"
+
+
+def test_complete_default_omits_reasoning_effort_kwarg(tmp_path, monkeypatch):
+    # The qwen classify/draft call path never passes reasoning_effort, so
+    # _call_provider must receive no such kwarg at all - proving that path's
+    # behaviour is byte-for-byte unchanged by this fix.
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    seen = {}
+
+    def fake(prompt, **kw):
+        seen.update(kw)
+        return "resp"
+
+    monkeypatch.setattr(llm, "_call_provider", fake)
+    llm.complete("p", provider="groq", model="qwen/qwen3.8-27b")
+    assert "reasoning_effort" not in seen
+
+
 def test_no_module_bypasses_the_llm_wrapper():
     """Every LLM call must route through src/llm.py so it gets cached."""
     from pathlib import Path

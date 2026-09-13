@@ -55,8 +55,22 @@ class NoAPIKeyError(RuntimeError):
 
 
 def cache_key(provider: str, model: str, prompt: str,
-              temperature: float, max_tokens: int) -> str:
-    blob = f"{provider}\x00{model}\x00{temperature}\x00{max_tokens}\x00{prompt}"
+              temperature: float, max_tokens: int,
+              reasoning_effort: str | None = None) -> str:
+    # IMPORTANT: when reasoning_effort is None (the default, used by every
+    # call site that existed before this parameter was added - notably the
+    # qwen classify/draft path), the blob is byte-for-byte identical to the
+    # pre-existing 5-field format. That is deliberate: it keeps every one of
+    # the ~439 already-committed qwen cache entries reachable. Only when a
+    # caller passes a real reasoning_effort value does the key gain a new
+    # segment, which is what makes a reasoning_effort="low" judge call
+    # compute a key distinct from both the legacy format AND from a plain
+    # None call - see tests/test_llm.py.
+    if reasoning_effort is None:
+        blob = f"{provider}\x00{model}\x00{temperature}\x00{max_tokens}\x00{prompt}"
+    else:
+        blob = (f"{provider}\x00{model}\x00{temperature}\x00{max_tokens}\x00"
+                f"{reasoning_effort}\x00{prompt}")
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -102,7 +116,8 @@ def _cache_put(db: Path, k: str, response: str,
 
 
 def _call_provider(prompt: str, *, provider: str, model: str,
-                   temperature: float, max_tokens: int) -> str:
+                   temperature: float, max_tokens: int,
+                   reasoning_effort: str | None = None) -> str:
     """Live API call. Isolated so tests can monkeypatch it."""
     env_var = _KEY_ENV.get(provider, "")
     if env_var and not os.environ.get(env_var):
@@ -131,12 +146,18 @@ def _call_provider(prompt: str, *, provider: str, model: str,
         from groq import Groq
 
         client = Groq(api_key=os.environ["GROQ_API_KEY"])
-        resp = client.chat.completions.create(
+        kwargs = dict(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        # Only added when explicitly requested (e.g. the judge call on the
+        # gpt-oss-120b reasoning model), and omitted entirely otherwise, so
+        # the qwen classify/draft call path is byte-for-byte unchanged.
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        resp = client.chat.completions.create(**kwargs)
         return (resp.choices[0].message.content or "").strip()
 
     raise ValueError(f"unknown provider: {provider}")
@@ -144,9 +165,11 @@ def _call_provider(prompt: str, *, provider: str, model: str,
 
 def complete(prompt: str, *, provider: str, model: str,
              temperature: float = config.TEMPERATURE,
-             max_tokens: int = 512, use_cache: bool = True) -> str:
+             max_tokens: int = 512, use_cache: bool = True,
+             reasoning_effort: str | None = None) -> str:
     db = config.CACHE_DB
-    k = cache_key(provider, model, prompt, temperature, max_tokens)
+    k = cache_key(provider, model, prompt, temperature, max_tokens,
+                  reasoning_effort)
 
     if use_cache:
         hit = _cache_get(db, k)
@@ -156,8 +179,11 @@ def complete(prompt: str, *, provider: str, model: str,
 
     _STATS["misses"] += 1
 
-    out = _call_provider(prompt, provider=provider, model=model,
-                         temperature=temperature, max_tokens=max_tokens)
+    call_kwargs = dict(provider=provider, model=model,
+                        temperature=temperature, max_tokens=max_tokens)
+    if reasoning_effort is not None:
+        call_kwargs["reasoning_effort"] = reasoning_effort
+    out = _call_provider(prompt, **call_kwargs)
     _cache_put(db, k, out, provider, model, prompt)
     return out
 

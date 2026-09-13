@@ -110,6 +110,6 @@ def judge_reply(customer: str, reply: str, cases: list[Case],
     raw = llm.complete(
         build_judge_prompt(customer, reply, cases),
         provider=config.JUDGE_PROVIDER, model=config.JUDGE_MODEL,
-        max_tokens=200, use_cache=use_cache,
+        max_tokens=200, use_cache=use_cache, reasoning_effort="low",
     )
     return parse_verdict(raw)

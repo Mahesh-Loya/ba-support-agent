@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,16 @@ _MAX_RETRIES = 5
 _BASE_DELAY_S = 2.0
 _MAX_DELAY_S = 30.0
 _PROGRESS_EVERY = 25
+
+# --- Ruling P: bounded concurrency for network-bound LLM calls --------------
+# The measured bottleneck is round-trip latency (and rate-limit backoff), not
+# model compute (0.45-1.1s per call directly, ~3.7s observed serially) - so
+# threads are the right tool, not multiprocessing (no CPU-bound work here,
+# and multiprocessing would only add pickling overhead for I/O-bound calls).
+# Default of 8 is conservative for a free-tier provider; tune down via the
+# `max_workers` parameter (or by editing this constant) if the provider
+# starts rate-limiting harder under concurrency than it does serially.
+MAX_WORKERS = 8
 
 
 def _with_retry(fn, *args, **kwargs):
@@ -57,6 +69,44 @@ def _progress(i: int, n: int, label: str) -> None:
         print(f"{label}: {i}/{n} processed")
 
 
+def _parallel_map(fn, items, *, max_workers: int = MAX_WORKERS, label: str = ""):
+    """Map fn over items with bounded concurrency, preserving input order.
+
+    `executor.map` returns results in the order its inputs were given,
+    regardless of which worker happens to finish first - completion order
+    never leaks into the output - so no manual index bookkeeping is needed
+    to stay ordered. Downstream code pairs these results positionally against
+    golden rows, so that ordering guarantee is load-bearing.
+
+    Progress is a lock-protected counter incremented as each call *completes*
+    (so it may tick slightly out of input order under concurrency - that's
+    fine, it is only a heartbeat so a long unattended run never goes silent
+    for minutes).
+
+    Any exception raised inside a worker propagates out of `list(...)` below
+    instead of being swallowed - a silently-eaten worker exception would mean
+    a missing/garbage row silently corrupting every downstream metric.
+    """
+    items = list(items)
+    n = len(items)
+    count = 0
+    lock = threading.Lock()
+
+    def _call(x):
+        nonlocal count
+        result = fn(x)
+        with lock:
+            count += 1
+            _progress(count, n, label)
+        return result
+
+    if max_workers <= 1 or n <= 1:
+        return [_call(x) for x in items]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        return list(ex.map(_call, items))
+
+
 def _retriever() -> Retriever:
     global _RETRIEVER
     if _RETRIEVER is None:
@@ -66,17 +116,22 @@ def _retriever() -> Retriever:
 
 def _simple_model() -> baselines.SimpleBaseline:
     """Trained on corpus-split messages labelled by the LLM classifier's cached
-    predictions - the golden set is never used for training."""
+    predictions - the golden set is never used for training.
+
+    Deliberately still trained on the full 2,000-message sample: shrinking it
+    would speed this up but would weaken the TF-IDF baseline relative to the
+    LLM agent, which is the dishonest direction. Speed comes only from running
+    those 2,000 classify calls concurrently, never from sampling fewer of
+    them."""
     global _SIMPLE
     if _SIMPLE is None:
         df = pd.read_parquet(config.INTERIM_DIR / "ba_pairs.parquet")
         corpus = df[df.split == "corpus"].sample(2000, random_state=config.SEED)
         texts = corpus.customer_text.astype(str).tolist()
-        labels = []
-        n = len(texts)
-        for i, t in enumerate(texts, 1):
-            labels.append(_with_retry(C.classify, t).intent)
-            _progress(i, n, "baseline training labels")
+        classifications = _parallel_map(
+            lambda t: _with_retry(C.classify, t), texts,
+            label="baseline training labels")
+        labels = [c.intent for c in classifications]
         m = baselines.SimpleBaseline().fit(texts, labels)
         m.fit_replies(texts, corpus.agent_text.astype(str).tolist())
         _SIMPLE = m
@@ -94,23 +149,36 @@ def run_agent(golden: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
     texts = golden.customer_text.astype(str).tolist()
     margins = _clf_margin(texts)
 
+    # Phase 1: classify every message concurrently.
+    classifications = _parallel_map(
+        lambda t: _with_retry(C.classify, t), texts, label="run_agent classify")
+
+    # Retrieval is local (embeddings + numpy), not a network call, so it is
+    # not a bottleneck and is left serial for simplicity.
+    cases_list = [r.search(t, k=5) for t in texts]
+    top_sims = [cases[0].similarity if cases else 0.0 for cases in cases_list]
+
+    # Phase 2: draft every reply concurrently. Each draft depends on its own
+    # message's classification + retrieved cases (computed above), not on
+    # any other row, so this is safe to run in a second parallel pass indexed
+    # by position - order is preserved throughout.
+    replies = _parallel_map(
+        lambda i: _with_retry(F.draft_reply, texts[i], classifications[i].intent,
+                               cases_list[i]),
+        range(len(texts)), label="run_agent draft")
+
     rows = []
-    n = len(golden)
-    for i, ((_, row), margin) in enumerate(zip(golden.iterrows(), margins), 1):
-        text = str(row.customer_text)
-        cls = _with_retry(C.classify, text)
-        cases = r.search(text, k=5)
-        top_sim = cases[0].similarity if cases else 0.0
-        reply = _with_retry(F.draft_reply, text, cls.intent, cases)
-        d = D.decide(text, cls.intent, cls.confidence, top_sim, float(margin), threshold)
+    for i, (_, row) in enumerate(golden.iterrows()):
+        cls = classifications[i]
+        d = D.decide(texts[i], cls.intent, cls.confidence, top_sims[i],
+                     float(margins[i]), threshold)
         rows.append(dict(
             customer_tweet_id=int(row.customer_tweet_id),
             pred_intent=cls.intent, confidence=cls.confidence,
-            top_similarity=top_sim, clf_margin=float(margin),
+            top_similarity=top_sims[i], clf_margin=float(margins[i]),
             score=d.score, action=d.action, reason=d.reason,
-            rule_fired=d.rule_fired, reply=reply,
+            rule_fired=d.rule_fired, reply=replies[i],
         ))
-        _progress(i, n, "run_agent")
     return pd.DataFrame(rows)
 
 
@@ -149,18 +217,20 @@ def _judge_agreement() -> list[dict] | None:
         return None
 
     r = _retriever()
+    texts = quality.customer_text.astype(str).tolist()
+    agent_texts = quality.agent_text.astype(str).tolist()
+    cases_list = [r.search(t, k=5) for t in texts]
+
+    verdicts = _parallel_map(
+        lambda i: _with_retry(judge.judge_reply, texts[i], agent_texts[i], cases_list[i]),
+        range(len(texts)), label="judge agreement")
+
     human = {axis: [] for axis in judge.AXES}
     judged = {axis: [] for axis in judge.AXES}
-
-    n = len(quality)
-    for i, row in enumerate(quality.itertuples(), 1):
-        cases = r.search(str(row.customer_text), k=5)
-        v = _with_retry(judge.judge_reply, str(row.customer_text),
-                        str(row.agent_text), cases)
+    for i, row in enumerate(quality.itertuples()):
         for axis in judge.AXES:
             human[axis].append(int(bool(getattr(row, axis))))
-            judged[axis].append(int(bool(getattr(v, axis))))
-        _progress(i, n, "judge agreement")
+            judged[axis].append(int(bool(getattr(verdicts[i], axis))))
 
     report = agreement.agreement_report(human, judged)
     return report.to_dict(orient="records")
@@ -189,12 +259,12 @@ def run_all(k: float = 20.0) -> dict:
 
     # --- reply quality via judge --------------------------------------------
     r = _retriever()
-    verdicts = []
-    n = len(merged)
-    for i, (t, rep) in enumerate(zip(merged.customer_text, merged.reply), 1):
-        cases = r.search(str(t), k=3)
-        verdicts.append(_with_retry(judge.judge_reply, str(t), str(rep), cases))
-        _progress(i, n, "judge (reply quality)")
+    texts = merged.customer_text.astype(str).tolist()
+    replies = merged.reply.astype(str).tolist()
+    cases_list = [r.search(t, k=3) for t in texts]
+    verdicts = _parallel_map(
+        lambda i: _with_retry(judge.judge_reply, texts[i], replies[i], cases_list[i]),
+        range(len(texts)), label="judge (reply quality)")
     harms = np.array([v.is_harmful for v in verdicts])
     for axis in judge.AXES:
         results.setdefault("reply", {})[axis] = float(

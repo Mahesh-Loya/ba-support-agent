@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 from src import llm
 
@@ -53,6 +55,49 @@ def test_miss_then_store_then_hit(tmp_path, monkeypatch):
 
     monkeypatch.setattr(llm, "_call_provider", explode)
     assert llm.complete("p2", provider="gemini", model="m") == "fresh"
+
+
+def test_cache_db_uses_wal_journal_mode(tmp_path):
+    # WAL is what lets concurrent cache reads proceed without being blocked by
+    # an in-flight write, and is what a second OS process running the same
+    # pipeline against the same file automatically inherits (it is stored in
+    # the database file itself, not per-connection).
+    db = tmp_path / "c.sqlite"
+    llm._init_db(db)
+    with llm._connect(db) as con:
+        mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+
+
+def test_concurrent_cache_writes_from_many_threads_are_not_dropped(tmp_path, monkeypatch):
+    # Simulates many parallel worker threads each producing a distinct
+    # never-before-seen prompt at roughly the same time. None of these writes
+    # may be lost (a dropped write means a silently repeated paid API call)
+    # and none may raise "database is locked".
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    llm._init_db(db)
+
+    n = 40
+    errors = []
+
+    def write_one(i):
+        try:
+            k = llm.cache_key("groq", "m", f"prompt-{i}", 0.0, 512)
+            llm._cache_put(db, k, f"response-{i}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append((i, exc))
+
+    threads = [threading.Thread(target=write_one, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    for i in range(n):
+        k = llm.cache_key("groq", "m", f"prompt-{i}", 0.0, 512)
+        assert llm._cache_get(db, k) == f"response-{i}"
 
 
 def test_no_module_bypasses_the_llm_wrapper():

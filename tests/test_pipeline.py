@@ -1,3 +1,5 @@
+import time
+
 import pandas as pd
 import pytest
 
@@ -172,3 +174,43 @@ def test_with_retry_gives_up_after_max_attempts_and_raises_last_error(monkeypatc
     with pytest.raises(RuntimeError, match="boom"):
         pipeline._with_retry(always_fails)
     assert calls["n"] == pipeline._MAX_RETRIES
+
+
+# --- Ruling P: bounded concurrency, order preservation ----------------------
+
+def test_parallel_map_preserves_input_order_despite_uneven_sleeps():
+    # Deliberately make early items sleep longer than later ones, so a naive
+    # "collect in completion order" implementation would visibly reorder the
+    # output. Every downstream metric pairs predictions against golden rows
+    # positionally, so this ordering guarantee is load-bearing.
+    delays = [0.2, 0.01, 0.15, 0.01, 0.1, 0.01, 0.05, 0.01]
+
+    def slow_double(i):
+        time.sleep(delays[i])
+        return i * 2
+
+    out = pipeline._parallel_map(slow_double, range(len(delays)), max_workers=8)
+    assert out == [i * 2 for i in range(len(delays))]
+
+
+def test_parallel_map_matches_serial_result_with_a_single_worker():
+    out = pipeline._parallel_map(lambda x: x + 1, range(10), max_workers=1)
+    assert out == [x + 1 for x in range(10)]
+
+
+def test_parallel_map_propagates_a_worker_exception_instead_of_swallowing_it():
+    def boom(i):
+        if i == 3:
+            raise ValueError(f"worker {i} exploded")
+        return i
+
+    with pytest.raises(ValueError, match="worker 3 exploded"):
+        pipeline._parallel_map(boom, range(6), max_workers=4)
+
+
+def test_parallel_map_reports_progress_under_the_hood(monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "_PROGRESS_EVERY", 2)
+    out = pipeline._parallel_map(lambda x: x, range(5), max_workers=4, label="widgets")
+    assert out == [0, 1, 2, 3, 4]
+    captured = capsys.readouterr().out
+    assert "widgets: 5/5 processed" in captured

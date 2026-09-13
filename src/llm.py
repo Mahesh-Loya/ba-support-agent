@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 from src import config
@@ -16,6 +17,37 @@ from src import config
 _STATS = {"hits": 0, "misses": 0}
 
 _KEY_ENV = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY"}
+
+# --- concurrency ------------------------------------------------------------
+# The cache file is read/written from many threads in this process (parallel
+# LLM calls in src/pipeline.py) AND from other OS processes running the same
+# pipeline against the same committed cache file. Two things make that safe:
+#
+# 1. WAL journal mode. Once set, it is persisted in the database file itself,
+#    so every connection that opens this file afterwards - in this process or
+#    any other, old code or new - uses WAL automatically. WAL lets readers
+#    (cache hits, the overwhelming majority of calls) proceed concurrently
+#    with a writer instead of being blocked by the default rollback journal's
+#    exclusive write lock. Only writer-vs-writer contention remains, and that
+#    window is a single small INSERT.
+# 2. A generous busy_timeout (set both via connect(timeout=...) and via the
+#    PRAGMA, belt-and-suspenders) so a connection that does lose that brief
+#    writer-vs-writer race *waits* for the lock instead of raising
+#    "database is locked" immediately. That is what a bare 5s default timeout
+#    under real concurrency would risk, and a raised/swallowed write here is
+#    exactly the failure this project cannot afford (see cache_key docstring
+#    below): it would either force a repeated paid API call or, worse, silently
+#    fail to extend the committed cache.
+#
+# A module-level lock additionally serialises the write itself *within this
+# process* (cheap - it's one INSERT) so this process's own worker threads
+# never even attempt to race each other for the write lock. It is not needed
+# for cross-process correctness (WAL + busy_timeout already guarantee that);
+# it just avoids pointless contention/backoff among our own threads. Reads
+# are deliberately NOT put behind this lock - cache hits must stay nearly
+# free and concurrent with each other and with the in-flight write.
+_WRITE_LOCK = threading.Lock()
+_BUSY_TIMEOUT_S = 30.0
 
 
 class NoAPIKeyError(RuntimeError):
@@ -28,9 +60,19 @@ def cache_key(provider: str, model: str, prompt: str,
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _connect(db: Path) -> sqlite3.Connection:
+    """Every cache connection goes through here so WAL + a generous busy
+    timeout are applied uniformly, whether this is a read or a write, and
+    regardless of how many threads/processes are touching the file."""
+    con = sqlite3.connect(db, timeout=_BUSY_TIMEOUT_S)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_S * 1000)}")
+    return con
+
+
 def _init_db(db: Path) -> None:
     db.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db) as con:
+    with _connect(db) as con:
         con.execute(
             "CREATE TABLE IF NOT EXISTS cache ("
             "  k TEXT PRIMARY KEY,"
@@ -42,7 +84,7 @@ def _init_db(db: Path) -> None:
 def _cache_get(db: Path, k: str) -> str | None:
     if not db.exists():
         return None
-    with sqlite3.connect(db) as con:
+    with _connect(db) as con:
         row = con.execute("SELECT response FROM cache WHERE k = ?", (k,)).fetchone()
     return row[0] if row else None
 
@@ -50,12 +92,13 @@ def _cache_get(db: Path, k: str) -> str | None:
 def _cache_put(db: Path, k: str, response: str,
                provider: str = "", model: str = "", prompt: str = "") -> None:
     _init_db(db)
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "INSERT OR REPLACE INTO cache (k, provider, model, prompt, response)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (k, provider, model, prompt, response),
-        )
+    with _WRITE_LOCK:
+        with _connect(db) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO cache (k, provider, model, prompt, response)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (k, provider, model, prompt, response),
+            )
 
 
 def _call_provider(prompt: str, *, provider: str, model: str,
@@ -122,6 +165,6 @@ def complete(prompt: str, *, provider: str, model: str,
 def cache_stats() -> dict:
     entries = 0
     if config.CACHE_DB.exists():
-        with sqlite3.connect(config.CACHE_DB) as con:
+        with _connect(config.CACHE_DB) as con:
             entries = con.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
     return {"entries": entries, **_STATS}

@@ -147,7 +147,6 @@ def _clf_margin(texts: list[str]) -> list[float]:
 def run_agent(golden: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
     r = _retriever()
     texts = golden.customer_text.astype(str).tolist()
-    margins = _clf_margin(texts)
 
     # Phase 1: classify every message concurrently.
     classifications = _parallel_map(
@@ -166,6 +165,17 @@ def run_agent(golden: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
         lambda i: _with_retry(F.draft_reply, texts[i], classifications[i].intent,
                                cases_list[i]),
         range(len(texts)), label="run_agent draft")
+
+    # Ruling O: compute clf_margin LAST, only after every golden-set classify
+    # and draft call has already landed (and been cached by src/llm.py).
+    # `_clf_margin` trains the 2,000-call TF-IDF baseline on first use - doing
+    # this FIRST (the original bug) meant that entire baseline-training step
+    # ran before a single one of the 200 golden-set examples was classified
+    # or drafted, so a quota cutoff during it meant zero golden-set calls
+    # ever landed (or got cached) for the day. Moving it here means the
+    # golden-set's own (comparatively cheap, ~400-call) classify+draft work
+    # is done - and cached - before the expensive baseline step even starts.
+    margins = _clf_margin(texts)
 
     rows = []
     for i, (_, row) in enumerate(golden.iterrows()):
@@ -236,25 +246,52 @@ def _judge_agreement() -> list[dict] | None:
     return report.to_dict(orient="records")
 
 
+def _write_results(results: dict, merged: pd.DataFrame) -> None:
+    """Durably persist the current state of `results` + `merged`.
+
+    Called twice by `run_all`: once as an intermediate checkpoint right after
+    the golden-set-only sections are computed (before baseline training even
+    starts), and once more at the very end with the complete dict. Both calls
+    write the exact same two files, so a checkpoint write and the final write
+    are indistinguishable in shape - only the content differs depending on
+    how far the run got."""
+    out_dir = config.PROJECT_ROOT / "reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "results.json").write_text(
+        json.dumps(results, indent=2, default=float), encoding="utf-8")
+    merged.to_json(out_dir / "predictions.jsonl",
+                   orient="records", lines=True, force_ascii=False)
+
+
 def run_all(k: float = 20.0) -> dict:
+    """Ruling O: golden-set path runs to completion (and is durably
+    checkpointed) BEFORE the 2,000-call baseline-training step starts.
+
+    `_simple_model()` alone makes 2,000 LLM calls to label its TF-IDF
+    training corpus - on a free-tier quota that is an entire day's budget by
+    itself. If that step ran first (as it once did, transitively, via
+    `run_agent` -> `_clf_margin` -> `_simple_model`) and the quota cut out
+    partway through it, the run would end with zero golden-set numbers to
+    show for the whole day despite having spent the whole day. Reordering so
+    the golden-set sections run and get written to disk first means a
+    baseline-training failure or interruption still leaves a complete,
+    real set of agent numbers on disk - only the baseline comparison fields
+    are missing, never the whole file."""
     golden = pd.read_json(config.GOLDEN_DIR / "golden.jsonl", lines=True)
     golden = golden[golden["round"] == 1].reset_index(drop=True)
 
+    # --- golden-set agent run (order-critical: first, and cheap relative to
+    # baseline training - one classify + one draft call per golden row) -----
     preds = run_agent(golden, threshold=0.5)
     merged = golden.merge(preds, on="customer_tweet_id")
 
-    # --- intent: ours vs two baselines --------------------------------------
-    simple = _simple_model()
-    trivial = baselines.TrivialBaseline().fit(
-        golden.customer_text.tolist(), golden.intent.tolist())
-
     y = merged.intent.tolist()
-    results = {
+    results: dict = {
         "intent": {
             "agent": metrics.summary(y, merged.pred_intent.tolist()),
-            "simple": metrics.summary(y, simple.predict(merged.customer_text.tolist())),
-            "trivial": metrics.summary(y, trivial.predict(merged.customer_text.tolist())),
-        }
+        },
+        "_baseline_complete": False,
+        "_judge_agreement_complete": False,
     }
 
     # --- reply quality via judge --------------------------------------------
@@ -296,11 +333,47 @@ def run_all(k: float = 20.0) -> dict:
     human_action, agent_action = _human_agent_actions(merged)
     results["escalation"] = metrics.summary(human_action, agent_action)
 
-    # --- judge-vs-human agreement (Ruling A) ---------------------------------
-    results["judge_agreement"] = _judge_agreement()
+    # --- CHECKPOINT: everything above needs only `merged` - never the ------
+    # baseline models. Write results.json + predictions.jsonl NOW, before
+    # `_simple_model()` is touched at all, so a quota cutoff or crash during
+    # baseline training still leaves real, complete golden-set numbers on
+    # disk (intent.agent, reply, deployment, calibration, escalation) with
+    # `_baseline_complete: False` marking the file as a checkpoint rather
+    # than a full run.
+    _write_results(results, merged)
 
-    out = config.PROJECT_ROOT / "reports" / "results.json"
-    out.write_text(json.dumps(results, indent=2, default=float), encoding="utf-8")
-    merged.to_json(config.PROJECT_ROOT / "reports" / "predictions.jsonl",
-                   orient="records", lines=True, force_ascii=False)
+    # --- intent: ours vs two baselines (the expensive, 2,000-call step) -----
+    simple = _simple_model()
+    trivial = baselines.TrivialBaseline().fit(
+        golden.customer_text.tolist(), golden.intent.tolist())
+    results["intent"]["simple"] = metrics.summary(
+        y, simple.predict(merged.customer_text.tolist()))
+    results["intent"]["trivial"] = metrics.summary(
+        y, trivial.predict(merged.customer_text.tolist()))
+    results["_baseline_complete"] = True
+
+    # --- CHECKPOINT #2: the 2,000 real baseline-training calls just landed --
+    # and cost real quota. Persist them NOW, before `_judge_agreement()` runs
+    # - it goes through `_with_retry` against a real network stage and can
+    # raise after exhausting retries. Without this write, a judge-agreement
+    # failure would propagate out of run_all before the final write below,
+    # and the baseline results that were just genuinely paid for would never
+    # reach disk - the exact failure mode this whole fix exists to prevent,
+    # just moved one stage later.
+    _write_results(results, merged)
+
+    # --- judge-vs-human agreement (Ruling A) ---------------------------------
+    # `results` is always built fresh in memory here (run_all never reads
+    # back a prior checkpoint to resume from), so `_judge_agreement_complete`
+    # is always False at this point and this guard is always taken. It is
+    # kept only as a documented no-op placeholder for a future
+    # resume-from-checkpoint path - it is not real resume logic today.
+    if not results["_judge_agreement_complete"]:
+        judge_agreement = _judge_agreement()
+        results["judge_agreement"] = judge_agreement
+        results["_judge_agreement_complete"] = judge_agreement is not None
+
+    # --- FINAL write: golden-set sections + baseline sections + judge ------
+    # agreement, all present.
+    _write_results(results, merged)
     return results

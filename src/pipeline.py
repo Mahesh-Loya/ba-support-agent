@@ -30,15 +30,22 @@ _BASE_DELAY_S = 2.0
 _MAX_DELAY_S = 30.0
 _PROGRESS_EVERY = 25
 
-# --- Ruling P: bounded concurrency for network-bound LLM calls --------------
-# The measured bottleneck is round-trip latency (and rate-limit backoff), not
-# model compute (0.45-1.1s per call directly, ~3.7s observed serially) - so
-# threads are the right tool, not multiprocessing (no CPU-bound work here,
-# and multiprocessing would only add pickling overhead for I/O-bound calls).
-# Default of 8 is conservative for a free-tier provider; tune down via the
-# `max_workers` parameter (or by editing this constant) if the provider
-# starts rate-limiting harder under concurrency than it does serially.
-MAX_WORKERS = 8
+# --- Ruling U: concurrency disabled by default - the account is token-budget
+# limited, not latency limited -------------------------------------------
+# Ruling P's assumption (bottleneck = round-trip latency) was WRONG, found by
+# running the real evaluation live: this Groq account has a strict 7,000
+# input-tokens-per-minute cap. At ~430 tokens/call that is ~16 calls/min flat,
+# NO MATTER how many workers fire concurrently - concurrency buys zero real
+# throughput here. Worse, 8 workers retrying in lockstep after a shared 429
+# collide again on the very next attempt (a synchronized "retry storm"),
+# which can exhaust an item's 5 retries and crash the whole run even though
+# the account is nowhere near its DAILY quota. `_parallel_map` already falls
+# back to a plain serial loop when max_workers <= 1, so MAX_WORKERS=1 gets
+# the exact same correct, ordered result with no collision risk and no
+# wasted retry budget. Raise this only for a provider/tier with real
+# per-connection (not per-account) rate limits - verify that assumption
+# live before doing so, the same way this one was found to be false.
+MAX_WORKERS = 1
 
 
 def _with_retry(fn, *args, **kwargs):

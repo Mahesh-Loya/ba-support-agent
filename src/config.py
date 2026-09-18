@@ -22,12 +22,25 @@ TEMPERATURE = 0.0
 
 # --- Models -------------------------------------------------------------
 # Drafter and judge are deliberately different families so the judge never
-# grades its own output. Both live on the Groq free tier (the only key this
-# project has). qwen/qwen3.6-27b was tried and rejected: it emits <think>
-# blocks that break JSON parsing. The stronger model (gpt-oss-120b) is
-# deliberately the judge, not the drafter.
-DRAFTER_MODEL = "qwen/qwen3.8-27b"
-DRAFTER_PROVIDER = "groq"
+# grades its own output - now doubly true, since they are on different
+# COMPANIES' models, not just different models on one provider.
+#
+# History: both originally lived on Groq's free tier (qwen for drafter,
+# gpt-oss-120b for judge; qwen/qwen3.6-27b was tried first and rejected -
+# it emits <think> blocks that break JSON parsing). Groq's free tier caps
+# at 200,000 tokens/day account-wide, which made the ~2,200-call drafter
+# workload (baseline training + golden-set classify/draft) a multi-day
+# bottleneck. The drafter moved to a paid OpenAI key (200,000 tokens/MINUTE,
+# no observed daily cap) to remove that bottleneck; gpt-4o-mini was chosen
+# over anything newer on the account (gpt-5.x, gpt-6-astra) because those
+# postdate this assistant's training and an unfamiliar model's behaviour
+# should never be gambled on a 2,000-call unattended run - gpt-4o-mini is
+# well-understood and was verified live before use. The judge stays on Groq
+# (gpt-oss-120b): it never hit a rate limit all session, so there was no
+# reason to move it, and keeping it on a separate provider from the drafter
+# is strictly better for the never-self-grade guarantee than moving both.
+DRAFTER_MODEL = "gpt-4o-mini"
+DRAFTER_PROVIDER = "openai"
 JUDGE_MODEL = "openai/gpt-oss-120b"
 JUDGE_PROVIDER = "groq"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"

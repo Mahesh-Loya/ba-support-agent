@@ -16,7 +16,20 @@ from src import config
 
 _STATS = {"hits": 0, "misses": 0}
 
-_KEY_ENV = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY"}
+_KEY_ENV = {
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+# Hard ceiling on max_tokens for any single call, regardless of provider. This
+# is a safety net against a caller (or a bug) accidentally requesting an
+# absurd completion size - e.g. max_tokens=1_000_000 - which now costs real
+# money on the OpenAI path (unlike the free Groq tier used so far). Enforced
+# in complete() before any cache lookup or network call. The highest
+# max_tokens used anywhere in this project today is judge_reply's 200, so
+# this is a no-op for current behaviour.
+_MAX_ALLOWED_TOKENS = 4000
 
 # --- concurrency ------------------------------------------------------------
 # The cache file is read/written from many threads in this process (parallel
@@ -160,6 +173,30 @@ def _call_provider(prompt: str, *, provider: str, model: str,
         resp = client.chat.completions.create(**kwargs)
         return (resp.choices[0].message.content or "").strip()
 
+    if provider == "openai":
+        if reasoning_effort is not None:
+            # reasoning_effort is a Groq-specific parameter (gpt-oss-120b's
+            # reasoning-token quirk). Silently dropping it here would still
+            # let it leak into cache_key(), computing a DIFFERENT cache key
+            # than the equivalent reasoning_effort=None call for the exact
+            # same underlying request - a real duplicate-paid-call risk. Fail
+            # loud instead of silently costing money later.
+            raise ValueError(
+                "reasoning_effort is a Groq-specific parameter and must not "
+                "be passed with provider='openai'"
+            )
+
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
     raise ValueError(f"unknown provider: {provider}")
 
 
@@ -167,6 +204,14 @@ def complete(prompt: str, *, provider: str, model: str,
              temperature: float = config.TEMPERATURE,
              max_tokens: int = 512, use_cache: bool = True,
              reasoning_effort: str | None = None) -> str:
+    if max_tokens > _MAX_ALLOWED_TOKENS:
+        raise ValueError(
+            f"max_tokens={max_tokens} exceeds the hard ceiling of "
+            f"{_MAX_ALLOWED_TOKENS}. This guard exists to prevent an "
+            f"accidental runaway-cost request; if you genuinely need more "
+            f"tokens, raise _MAX_ALLOWED_TOKENS deliberately."
+        )
+
     db = config.CACHE_DB
     k = cache_key(provider, model, prompt, temperature, max_tokens,
                   reasoning_effort)

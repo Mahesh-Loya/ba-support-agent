@@ -1,3 +1,4 @@
+import sys
 import threading
 
 import pytest
@@ -147,6 +148,101 @@ def test_complete_default_omits_reasoning_effort_kwarg(tmp_path, monkeypatch):
     assert "reasoning_effort" not in seen
 
 
+def test_complete_openai_path_returns_and_caches_mocked_value(tmp_path, monkeypatch):
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    monkeypatch.setattr(llm, "_call_provider", lambda *a, **k: "openai reply")
+
+    out = llm.complete("hi", provider="openai", model="gpt-4o-mini")
+    assert out == "openai reply"
+
+    def explode(*a, **k):
+        raise AssertionError("second call should hit cache")
+
+    monkeypatch.setattr(llm, "_call_provider", explode)
+    assert llm.complete("hi", provider="openai", model="gpt-4o-mini") == "openai reply"
+
+
+def test_openai_cache_miss_without_api_key_raises_actionable_error(tmp_path, monkeypatch):
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(llm.NoAPIKeyError) as e:
+        llm.complete("uncached prompt", provider="openai", model="gpt-4o-mini")
+    assert "OPENAI_API_KEY" in str(e.value)
+
+
+def test_openai_branch_never_forwards_reasoning_effort(monkeypatch):
+    # reasoning_effort exists only for Groq's gpt-oss-120b reasoning-token
+    # quirk. gpt-4o-mini is not a reasoning model. Rather than silently
+    # dropping the parameter (which would still leak into cache_key() and
+    # risk a duplicate paid call for the "same" request - see cache_key's
+    # reasoning_effort tests), the openai branch must fail loudly and
+    # immediately, before ever constructing the OpenAI client or calling its
+    # SDK.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def explode_ctor(api_key=None):
+        raise AssertionError("OpenAI client must never be constructed")
+
+    fake_module = type(sys)("openai")
+    fake_module.OpenAI = explode_ctor
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        llm._call_provider(
+            "p", provider="openai", model="gpt-4o-mini",
+            temperature=0.0, max_tokens=50, reasoning_effort="low",
+        )
+
+
+def test_complete_openai_reasoning_effort_raises_before_any_cache_write(
+    tmp_path, monkeypatch
+):
+    # End-to-end via complete(): a caller who copy-pastes the Groq judge
+    # pattern (reasoning_effort="low") onto provider="openai" must get a loud
+    # immediate ValueError, not a silently-computed alternate cache key that
+    # could trigger a real duplicate paid call later. The OpenAI SDK must
+    # never even be reached, and no cache file/row may be created.
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def explode_ctor(api_key=None):
+        raise AssertionError("OpenAI client must never be constructed")
+
+    fake_module = type(sys)("openai")
+    fake_module.OpenAI = explode_ctor
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        llm.complete("p", provider="openai", model="gpt-4o-mini",
+                     reasoning_effort="low")
+    assert not db.exists()
+
+
+def test_complete_rejects_max_tokens_above_ceiling_before_any_call(tmp_path, monkeypatch):
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+
+    def explode(*a, **k):
+        raise AssertionError("must not reach _call_provider when over ceiling")
+
+    monkeypatch.setattr(llm, "_call_provider", explode)
+    with pytest.raises(ValueError):
+        llm.complete("p", provider="openai", model="gpt-4o-mini", max_tokens=5000)
+    # also must not have touched the cache
+    assert not db.exists()
+
+
+def test_complete_allows_max_tokens_exactly_at_ceiling(tmp_path, monkeypatch):
+    db = tmp_path / "c.sqlite"
+    monkeypatch.setattr(llm.config, "CACHE_DB", db)
+    monkeypatch.setattr(llm, "_call_provider", lambda *a, **k: "ok")
+    out = llm.complete("p", provider="openai", model="gpt-4o-mini", max_tokens=4000)
+    assert out == "ok"
+
+
 def test_no_module_bypasses_the_llm_wrapper():
     """Every LLM call must route through src/llm.py so it gets cached."""
     from pathlib import Path
@@ -157,6 +253,7 @@ def test_no_module_bypasses_the_llm_wrapper():
         if py.name == "llm.py":
             continue
         text = py.read_text(encoding="utf-8")
-        if "from groq import" in text or "from google import genai" in text:
+        if ("from groq import" in text or "from google import genai" in text
+                or "from openai import" in text or "import openai" in text):
             offenders.append(py.name)
     assert not offenders, f"these bypass the cache: {offenders}"

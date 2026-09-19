@@ -1,6 +1,6 @@
 # Decision log
 
-Fifteen non-obvious decisions made while building this project, and why.
+Eighteen non-obvious decisions made while building this project, and why.
 Evidence for each (measurements, commits, code) lives in
 `.superpowers/sdd/2026-09-11-ba-support-agent/progress.md`; this file states
 the decision and the reasoning, not the full derivation.
@@ -74,23 +74,24 @@ params)` and looked up in `cache/llm_cache.sqlite`, which is deliberately
 mechanism that is supposed to let a reviewer clone the repo and run
 `python -m src.cli reproduce` with zero API key and get the same numbers
 back — the free-tier constraint and the 15-minute reproduction requirement
-both depend on it. As of this writing the cache file does not yet exist
-(no live pipeline run has happened — see README Status); the design and the
-code path are in place and tested, but the cache has not yet been
-populated by an actual run.
+both depend on it. This was verified for real, not just designed: a clean
+`python -m src.cli reproduce` with every API key explicitly unset completed
+in 2 minutes 55 seconds and printed the same numbers as the live run.
 
-## 7. Judge and drafter are deliberately different model families, and the stronger model is the judge
+## 7. Judge and drafter are on two different companies' models, not just two different models
 
-Both live on the Groq free tier: drafter/classifier is `qwen/qwen3.8-27b`,
-judge is `openai/gpt-oss-120b` — different lineages, so the judge never
-grades output from its own family. A fourth candidate model
-(`qwen/qwen3.6-27b`) was measured and rejected because it emits `<think>`
-reasoning blocks that break strict JSON parsing. The *stronger* model was
-deliberately assigned to the judge, not the drafter, because judge
-reliability gates every reply-quality and harm-rate number in the report,
-while a 27B model is ample for drafting 1-2 sentence support tweets. Giving
-the agent the weaker model is the direction of bias that is honest to err
-in: it can only make the agent's own numbers look worse, not better.
+The judge (`openai/gpt-oss-120b`, via Groq) never grades output from the
+drafter (`gpt-4o-mini`, via OpenAI) — a stronger guarantee against
+self-grading than merely picking two different model sizes from one
+vendor. This wasn't the original plan: both roles started on Groq's free
+tier (`qwen/qwen3.8-27b` drafting, `gpt-oss-120b` judging — a fourth
+candidate, `qwen/qwen3.6-27b`, was measured and rejected for emitting
+`<think>` blocks that break JSON parsing). The drafter moved to OpenAI for
+the reason in decision 16. The *stronger* model stayed the judge, not the
+drafter, because judge reliability gates every reply-quality and harm-rate
+number in the report, while a small model is ample for drafting 1-2
+sentence support tweets — giving the agent the weaker model is the honest
+direction to err in.
 
 ## 8. Embeddings run locally (all-MiniLM-L6-v2), never via API
 
@@ -196,3 +197,63 @@ validated against the real 7,825-row corpus — moves the very bar the LLM
 agent is measured against, which is backwards. The fixture was fixed
 instead (a balanced, 12-row set with varied vocabulary), and the baseline
 reverted to `C=1.0` (sklearn's default).
+
+## 16. The drafter moved from Groq's free tier to a paid OpenAI key mid-project
+
+Groq's free tier caps at 200,000 tokens/day, account-wide, for the drafter
+model. That is smaller than the ~2,200 drafter-role calls this project
+needs (2,000 for baseline training alone), so the free tier made the real
+evaluation run a genuine multi-day, quota-limited process — confirmed
+directly by running it and watching it exhaust mid-run twice. A separate,
+independent bug compounded this: raising `MAX_WORKERS` to 8 to try to go
+faster made things *worse*, because the real bottleneck was a 7,000-
+tokens-per-minute cap, not connection latency — 8 workers retrying in
+lockstep after a shared 429 collided again on their very next attempt,
+risking a permanently failed item rather than any speedup (fixed by
+setting `MAX_WORKERS=1`; see `src/pipeline.py`'s comment for the measured
+numbers). Neither problem is solvable by writing better code against a
+free tier with a hard account-wide ceiling. A paid OpenAI key removes it:
+verified live at 200,000 tokens/*minute* with no observed daily cap,
+costing an estimated $2-5 for the entire remaining workload at
+`gpt-4o-mini` pricing ($0.15/$0.60 per million tokens). `gpt-4o-mini` was
+chosen deliberately over newer models already available on the same
+account (`gpt-5.x`, `gpt-6-astra`) because those postdate this project's
+own model-assisted development and risking a ~2,200-call unattended run on
+an unfamiliar model's behaviour is exactly the mistake that caused the
+`gpt-oss-120b` empty-response bug (decision 11) in the first place — a
+model should be live-verified before being trusted at volume, not assumed
+safe because it is newer.
+
+## 17. The first quality-label pass was rejected and partially redone
+
+The human's first full pass over the 100-example quality set (judging BA's
+actual historical replies on 4 axes) came back statistically implausible:
+100/0, 100/0, 100/0, and 97/3 — near-unanimous "yes," inconsistent with
+independently measured corpus facts (14% of BA replies deflect to DM,
+6.8% are link-only). Rather than accept it, a random 25-example subset was
+relabelled with explicit attention to three concrete patterns (a
+DM-deflection with no real answer is not `helpful`; a specific promise is
+an `overpromise`; an off-tone or robotic reply is not `on_brand`). The
+redone 25 showed real variance (`helpful`: 18 yes / 7 no). The final
+100-example file keeps the careful redo wherever it exists and the
+original elsewhere (75 examples), producing a file that is honest about
+being a mixed-confidence label set — see decision 18 for what this still
+costs the judge-agreement result.
+
+## 18. The judge-vs-human agreement came back weak, and that is reported as the finding, not hidden
+
+Cohen's kappa between the LLM judge and the human on the same 100 BA
+replies: -0.020 (`grounded`), 0.071 (`helpful`), 0.030 (`on_brand`), -0.019
+(`no_overpromise`) — poor to slight on every axis. Two different things are
+happening and the report distinguishes them rather than presenting one
+number: on `no_overpromise`, raw agreement is high (89%) but kappa is
+negative, the textbook signature of a near-constant human rater (99%
+"yes," largely because BA staff are trained not to promise specifics on
+Twitter) making kappa's chance-correction unstable regardless of the
+judge's real quality. On `grounded`/`helpful`/`on_brand`, raw agreement
+itself is only 52-61% — the judge is substantively disagreeing with the
+human, not just suffering a skewed baseline. The decision here is
+editorial, not technical: report both readings side by side rather than
+collapsing to "kappa is low, judge is bad" or explaining it away as "just
+a skewed sample" — the mandatory ask was evidence of agreement, and weak
+evidence, correctly characterised, is still the honest answer.

@@ -1,0 +1,149 @@
+{
+  "intent": {
+    "agent": {
+      "n": 198,
+      "accuracy": 0.6363636363636364,
+      "accuracy_ci": [
+        0.5656565656565656,
+        0.702020202020202
+      ],
+      "macro_f1": 0.5700489620847731,
+      "macro_f1_ci": [
+        0.4929403484189528,
+        0.6371243249474403
+      ]
+    },
+    "simple": {
+      "n": 198,
+      "accuracy": 0.4393939393939394,
+      "accuracy_ci": [
+        0.3686868686868687,
+        0.51010101010101
+      ],
+      "macro_f1": 0.34732473364661154,
+      "macro_f1_ci": [
+        0.2752126711018527,
+        0.41364138907962994
+      ]
+    },
+    "trivial": {
+      "n": 198,
+      "accuracy": 0.2474747474747475,
+      "accuracy_ci": [
+        0.18686868686868688,
+        0.30808080808080807
+      ],
+      "macro_f1": 0.044084570400359874,
+      "macro_f1_ci": [
+        0.034988179669030735,
+        0.05233805233805234
+      ]
+    }
+  },
+  "_baseline_complete": true,
+  "_judge_agreement_complete": true,
+  "reply": {
+    "grounded": 0.6666666666666666,
+    "helpful": 0.5959595959595959,
+    "on_brand": 0.8080808080808081,
+    "no_overpromise": 0.9545454545454546,
+    "harm_rate_all": 0.3383838383838384
+  },
+  "deployment": {
+    "k": 20.0,
+    "threshold": 0.76,
+    "coverage": 0.08585858585858586,
+    "harm_rate": 0.23529411764705882,
+    "expected_cost": 1.3181818181818181,
+    "degenerate": false,
+    "sensitivity": [
+      {
+        "k": 2,
+        "threshold": 0.6,
+        "coverage": 0.8080808080808081,
+        "harm_rate": 0.35625,
+        "expected_cost": 0.7676767676767677,
+        "degenerate": false
+      },
+      {
+        "k": 5,
+        "threshold": 0.76,
+        "coverage": 0.08585858585858586,
+        "harm_rate": 0.23529411764705882,
+        "expected_cost": 1.0151515151515151,
+        "degenerate": false
+      },
+      {
+        "k": 10,
+        "threshold": 0.76,
+        "coverage": 0.08585858585858586,
+        "harm_rate": 0.23529411764705882,
+        "expected_cost": 1.1161616161616161,
+        "degenerate": false
+      },
+      {
+        "k": 20,
+        "threshold": 0.76,
+        "coverage": 0.08585858585858586,
+        "harm_rate": 0.23529411764705882,
+        "expected_cost": 1.3181818181818181,
+        "degenerate": false
+      },
+      {
+        "k": 50,
+        "threshold": 0.76,
+        "coverage": 0.08585858585858586,
+        "harm_rate": 0.23529411764705882,
+        "expected_cost": 1.924242424242424,
+        "degenerate": false
+      }
+    ]
+  },
+  "calibration": {
+    "ece_llm_confidence": 0.2691919191919194,
+    "ece_routing_score": 0.05788010266041281
+  },
+  "escalation": {
+    "n": 198,
+    "accuracy": 0.7777777777777778,
+    "accuracy_ci": [
+      0.7220959595959596,
+      0.8383838383838383
+    ],
+    "macro_f1": 0.6675824175824175,
+    "macro_f1_ci": [
+      0.5852611550229475,
+      0.7453813813813814
+    ]
+  },
+  "judge_agreement": [
+    {
+      "axis": "grounded",
+      "kappa": -0.02,
+      "raw_agreement": 0.52,
+      "interpretation": "poor (worse than chance)",
+      "n": 100
+    },
+    {
+      "axis": "helpful",
+      "kappa": 0.071,
+      "raw_agreement": 0.52,
+      "interpretation": "slight",
+      "n": 100
+    },
+    {
+      "axis": "on_brand",
+      "kappa": 0.03,
+      "raw_agreement": 0.61,
+      "interpretation": "slight",
+      "n": 100
+    },
+    {
+      "axis": "no_overpromise",
+      "kappa": -0.019,
+      "raw_agreement": 0.89,
+      "interpretation": "poor (worse than chance)",
+      "n": 100
+    }
+  ]
+}

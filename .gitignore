@@ -12,3 +12,13 @@ venv/
 
 # NOTE: cache/llm_cache.sqlite is deliberately NOT ignored.
 # It is how reviewers reproduce headline numbers without an API key.
+
+# src/embed.py content-hashes every embed() call, including tiny fixtures
+# from the test suite - this stops that from polluting `git status` or
+# ever being accidentally committed. The real corpus/eval-scale embeddings
+# this project actually needs are already committed by filename below and
+# are unaffected by this pattern (gitignore never un-tracks a tracked file).
+data/interim/emb_*.npy
+!data/interim/emb_088dd255e5a3e4fc.npy
+!data/interim/emb_810cf83aecef3d94.npy
+!data/interim/emb_fc1d93f717899e15.npy
